@@ -84,3 +84,30 @@ y en nginx `client_max_body_size 8m;` en el sitio del panel. XAMPP en local ya t
   - Avisos: nueva solicitud (al instante), solicitudes sin atender (`leads:notify-stale`, cada hora), cierre de mes (`finance:notify-month-end`, 17:00, solo propietario).
   - Producción: cron `* * * * * cd /ruta/api && php artisan schedule:run >> /dev/null 2>&1`. El servidor debe poder salir por HTTPS a los servicios de push (fcm.googleapis.com, *.push.services.mozilla.com, *.notify.windows.com, *.push.apple.com).
   - Privacidad: las notificaciones solo llevan el número de solicitud y el servicio; nunca nombres, correos, teléfonos ni montos.
+
+## Despliegue en producción
+
+Requisitos: PHP 8.2+, Composer, extensiones PHP requeridas por Laravel, una base de datos compatible y un servidor web apuntando a la carpeta `public/`.
+
+```bash
+git clone https://github.com/MiguelGarciaBarahona/mykeportalapi.git
+cd mykeportalapi
+composer install --no-dev --optimize-autoloader
+cp .env.example .env
+php artisan key:generate
+# Editar .env con APP_URL, base de datos, correo, CORS y claves VAPID
+php artisan migrate --force
+php artisan storage:link
+php artisan config:cache
+php artisan route:cache
+php artisan view:cache
+php artisan push:vapid --write
+```
+
+El document root del dominio debe ser `public/`, nunca la raíz del proyecto. Configurar permisos de escritura para `storage/` y `bootstrap/cache/`. En producción, ejecutar el planificador cada minuto:
+
+```cron
+* * * * * cd /ruta/mykeportalapi && php artisan schedule:run >> /dev/null 2>&1
+```
+
+No subir `.env`, credenciales ni claves privadas al repositorio. Para actualizar una instalación existente: `git pull origin main`, ejecutar `composer install --no-dev --optimize-autoloader`, `php artisan migrate --force` y volver a ejecutar las cachés.
