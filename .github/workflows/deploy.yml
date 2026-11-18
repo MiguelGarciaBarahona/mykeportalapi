@@ -26,6 +26,7 @@ jobs:
           VPS_HOST_KEY: ${{ secrets.VPS_HOST_KEY }}
         run: |
           set -Eeuo pipefail
+          umask 077
           install -d -m 700 "$HOME/.ssh"
           printf '%s\n' "$VPS_SSH_KEY" > "$HOME/.ssh/mykeportalapi_key"
           printf '%s\n' "$VPS_HOST_KEY" > "$HOME/.ssh/known_hosts"
@@ -36,10 +37,13 @@ jobs:
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_SHA: ${{ github.sha }}
         run: |
           set -Eeuo pipefail
+          echo "[deploy] Solicitando publicación del commit $DEPLOY_SHA"
           ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
-            -i "$HOME/.ssh/mykeportalapi_key" "$VPS_USER@$VPS_HOST" 'bash -s' <<'REMOTE_SCRIPT'
+            -i "$HOME/.ssh/mykeportalapi_key" "$VPS_USER@$VPS_HOST" \
+            bash -s -- "$DEPLOY_SHA" <<'REMOTE_SCRIPT'
           set -Eeuo pipefail
           umask 077
 
@@ -50,116 +54,252 @@ jobs:
           RELEASE_ROOT=/www/wwwroot/.mykeportalapi-releases
           BACKUP_ROOT=/www/wwwroot/.mykeportalapi-backups
           CONTROL_ROOT=/www/wwwroot/.mykeportalapi-control
+          REQUESTED_SHA=${1:-}
           TIMESTAMP=$(date -u +%Y%m%d%H%M%S)
-          RELEASE_DIR="$RELEASE_ROOT/$TIMESTAMP-${GITHUB_SHA:-manual}"
-          BACKUP_DIR="$BACKUP_ROOT/$TIMESTAMP"
+          PHASE=initialization
+          PUBLISH_STARTED=0
+          BACKUP_READY=0
+          PREVIOUS_SHA=
+          TARGET=
+          RELEASE_DIR=
+          BACKUP_DIR=
 
-          test -d "$APP_DIR/.git"
-          test -x "$PHP"
-          test -x "$COMPOSER"
-          test -w "$APP_DIR"
-          test "$(df -Pk "$APP_DIR" | awk 'NR==2 {print $4}')" -ge 1048576
-          test -f "$APP_DIR/.env"
-          test -d "$APP_DIR/storage" && test -d "$APP_DIR/bootstrap/cache"
+          RSYNC_EXCLUDES=(
+            --exclude='.git/'
+            --exclude='.env'
+            --exclude='storage/'
+            --exclude='public/.user.ini'
+            --exclude='public/.well-known/'
+          )
 
-          assert_www_permissions() {
-            runuser -u www -- test -r "$APP_DIR/.env"
-            runuser -u www -- test -w "$APP_DIR/storage"
-            runuser -u www -- test -w "$APP_DIR/bootstrap/cache"
-            find "$APP_DIR/storage" "$APP_DIR/bootstrap/cache" -type d -exec runuser -u www -- test -x {} \;
-            find "$APP_DIR/storage" "$APP_DIR/bootstrap/cache" -type f -exec runuser -u www -- test -r {} \;
-          }
-          assert_www_permissions || {
-            echo 'Los permisos existentes no permiten a PHP-FPM (www) usar storage/bootstrap/cache; se detiene sin publicar.' >&2
-            exit 1
+          log() {
+            printf '[deploy][%s] %s\n' "$PHASE" "$*"
           }
 
-          mkdir -p "$CONTROL_ROOT" "$RELEASE_ROOT" "$BACKUP_ROOT"
+          fail() {
+            printf '[deploy][%s] ERROR: %s\n' "$PHASE" "$*" >&2
+            return 1
+          }
+
+          require_test() {
+            local description=$1
+            shift
+            if ! "$@"; then
+              fail "$description"
+            fi
+          }
+
+          write_deployed_marker() {
+            local sha=$1 marker
+            marker=$(mktemp "$CONTROL_ROOT/.deployed-commit.XXXXXX")
+            printf '%s\n' "$sha" > "$marker"
+            chmod 600 "$marker"
+            mv -f "$marker" "$CONTROL_ROOT/deployed-commit"
+          }
+
+          set_runtime_permissions() {
+            local root=$1
+            chown -R www:www "$root/storage" "$root/bootstrap/cache"
+            find "$root/storage" "$root/bootstrap/cache" -type d -exec chmod 775 {} +
+            find "$root/storage" "$root/bootstrap/cache" -type f -exec chmod 664 {} +
+          }
+
+          normalize_code_permissions() {
+            local root=$1
+            chmod 755 "$root"
+            find "$root" \
+              -path "$root/storage" -prune -o \
+              -path "$root/bootstrap/cache" -prune -o \
+              -type d -exec chmod 755 {} +
+            find "$root" \
+              -path "$root/storage" -prune -o \
+              -path "$root/bootstrap/cache" -prune -o \
+              -type f -exec chmod 644 {} +
+            chown root:www "$root/.env"
+            chmod 640 "$root/.env"
+          }
+
+          assert_www_runtime() {
+            local root=$1 inaccessible
+            require_test "www no puede atravesar $root" runuser -u www -- test -x "$root" || return 1
+            require_test "www no puede leer $root/.env" runuser -u www -- test -r "$root/.env" || return 1
+            require_test "www no puede leer vendor/autoload.php" runuser -u www -- test -r "$root/vendor/autoload.php" || return 1
+            require_test "www no puede leer public/index.php" runuser -u www -- test -r "$root/public/index.php" || return 1
+            require_test "www no puede escribir en storage" runuser -u www -- test -w "$root/storage" || return 1
+            require_test "www no puede escribir en bootstrap/cache" runuser -u www -- test -w "$root/bootstrap/cache" || return 1
+
+            inaccessible=$(runuser -u www -- find "$root/storage" "$root/bootstrap/cache" \
+              -type d ! -executable -print -quit)
+            test -z "$inaccessible" || { fail "www no puede atravesar $inaccessible"; return 1; }
+            inaccessible=$(runuser -u www -- find "$root/storage" "$root/bootstrap/cache" \
+              -type f ! -readable -print -quit)
+            test -z "$inaccessible" || { fail "www no puede leer $inaccessible"; return 1; }
+          }
+
+          rollback() {
+            local original_status=$1 rollback_status=0
+            trap - ERR
+            set +e
+            PHASE=rollback
+            log "Restaurando la versión $PREVIOUS_SHA desde $BACKUP_DIR"
+
+            rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$BACKUP_DIR/" "$APP_DIR/" || rollback_status=1
+            chmod 755 "$APP_DIR" || rollback_status=1
+            set_runtime_permissions "$APP_DIR" || rollback_status=1
+            assert_www_runtime "$APP_DIR" || rollback_status=1
+            git -C "$APP_DIR" update-ref refs/heads/main "$PREVIOUS_SHA" || rollback_status=1
+            write_deployed_marker "$PREVIOUS_SHA" || rollback_status=1
+            printf '%s|rollback|%s|%s\n' "$(date -u +%FT%TZ)" "$TARGET" "$PREVIOUS_SHA" \
+              >> "$CONTROL_ROOT/deploy-history.log" || rollback_status=1
+
+            if (( rollback_status != 0 )); then
+              echo '[deploy][rollback] ERROR: el rollback requiere revisión manual.' >&2
+            else
+              log "Rollback completado; versión restaurada: $PREVIOUS_SHA"
+            fi
+            exit "$original_status"
+          }
+
+          on_error() {
+            local status=$1 line=$2 command=$3
+            trap - ERR
+            printf '[deploy][%s] ERROR en línea %s (exit %s): %s\n' \
+              "$PHASE" "$line" "$status" "$command" >&2
+            if (( PUBLISH_STARTED == 1 && BACKUP_READY == 1 )); then
+              rollback "$status"
+            fi
+            exit "$status"
+          }
+          trap 'on_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
+
+          PHASE=preflight
+          log 'Validando parámetros, binarios y estructura de producción'
+          [[ "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ ]] || fail 'El SHA solicitado no es válido.'
+          require_test "No existe el repositorio en $APP_DIR" test -d "$APP_DIR/.git"
+          require_test "PHP 8.4 no es ejecutable: $PHP" test -x "$PHP"
+          require_test "Composer no es ejecutable: $COMPOSER" test -x "$COMPOSER"
+          require_test 'El directorio de producción no es escribible' test -w "$APP_DIR"
+          require_test 'Hay menos de 1 GiB libre para construir el release' \
+            test "$(df -Pk "$APP_DIR" | awk 'NR==2 {print $4}')" -ge 1048576
+          require_test 'Falta el archivo .env persistente' test -f "$APP_DIR/.env"
+          require_test 'Falta storage persistente' test -d "$APP_DIR/storage"
+          require_test 'Falta bootstrap/cache' test -d "$APP_DIR/bootstrap/cache"
+
+          install -d -m 700 "$CONTROL_ROOT" "$BACKUP_ROOT"
+          install -d -m 755 "$RELEASE_ROOT"
           exec 9>"$CONTROL_ROOT/deploy.lock"
-          flock -n 9 || { echo 'Ya existe un despliegue en curso.' >&2; exit 1; }
+          flock -n 9 || fail 'Ya existe un despliegue en curso.'
+          assert_www_runtime "$APP_DIR"
 
+          PHASE=source
+          log 'Verificando repositorio y commit solicitado'
           REMOTE_URL=$(git -C "$APP_DIR" remote get-url origin)
           case "$REMOTE_URL" in
-            https://github.com/$EXPECTED_REPO.git|git@github.com:$EXPECTED_REPO.git|git@github-mykeportalapi:$EXPECTED_REPO.git) ;;
-            *) echo 'El remoto origin no corresponde al repositorio esperado.' >&2; exit 1 ;;
+            https://github.com/"$EXPECTED_REPO".git|git@github.com:"$EXPECTED_REPO".git|git@github-mykeportalapi:"$EXPECTED_REPO".git) ;;
+            *) fail 'El remoto origin no corresponde al repositorio esperado.' ;;
           esac
 
           git -C "$APP_DIR" fetch --prune origin main
-          TARGET=$(git -C "$APP_DIR" rev-parse origin/main)
-          CURRENT=$(git -C "$APP_DIR" rev-parse HEAD)
-          git -C "$APP_DIR" merge-base --is-ancestor "$CURRENT" "$TARGET" || {
-            echo 'El despliegue remoto no es fast-forward; se detiene sin modificar producción.' >&2
-            exit 1
-          }
+          TARGET=$(git -C "$APP_DIR" rev-parse 'origin/main^{commit}')
+          test "$TARGET" = "$REQUESTED_SHA" || fail \
+            "origin/main ($TARGET) no coincide con el commit solicitado ($REQUESTED_SHA)."
 
-          test -f "$APP_DIR/package.json"
-          test -f "$APP_DIR/package-lock.json" || {
-            echo 'Falta package-lock.json en producción; no se ejecuta npm ci.' >&2
-            exit 1
-          }
-          grep -q '^APP_ENV=production' "$APP_DIR/.env"
-          grep -q '^APP_DEBUG=false' "$APP_DIR/.env"
+          if [[ -s "$CONTROL_ROOT/deployed-commit" ]]; then
+            PREVIOUS_SHA=$(tr -d '[:space:]' < "$CONTROL_ROOT/deployed-commit")
+          elif [[ -s "$APP_DIR/.deployed-commit" ]]; then
+            PREVIOUS_SHA=$(tr -d '[:space:]' < "$APP_DIR/.deployed-commit")
+          elif [[ -s "$APP_DIR/COMMIT" ]]; then
+            PREVIOUS_SHA=$(tr -d '[:space:]' < "$APP_DIR/COMMIT")
+          else
+            PREVIOUS_SHA=$(git -C "$APP_DIR" rev-parse 'HEAD^{commit}')
+          fi
+          git -C "$APP_DIR" cat-file -e "$PREVIOUS_SHA^{commit}" || fail \
+            "La versión previa $PREVIOUS_SHA no existe en el repositorio local."
+          git -C "$APP_DIR" merge-base --is-ancestor "$PREVIOUS_SHA" "$TARGET" || fail \
+            'El despliegue solicitado no es fast-forward respecto a la versión publicada.'
 
-          mkdir -p "$RELEASE_DIR"
+          RELEASE_DIR="$RELEASE_ROOT/$TIMESTAMP-$TARGET"
+          BACKUP_DIR="$BACKUP_ROOT/$TIMESTAMP-$PREVIOUS_SHA"
+          require_test "Ya existe el release $RELEASE_DIR" test ! -e "$RELEASE_DIR"
+
+          PHASE=build
+          log "Construyendo release $TARGET en $RELEASE_DIR"
+          umask 022
+          install -d -m 755 "$RELEASE_DIR"
           git -C "$APP_DIR" archive "$TARGET" | tar -x -C "$RELEASE_DIR"
-          cp -a "$APP_DIR/.env" "$RELEASE_DIR/.env"
-          cp -a "$APP_DIR/package-lock.json" "$RELEASE_DIR/package-lock.json"
+          require_test 'package-lock.json no está versionado en el commit solicitado' \
+            test -f "$RELEASE_DIR/package-lock.json"
+          install -m 640 -o root -g www "$APP_DIR/.env" "$RELEASE_DIR/.env"
           rsync -a "$APP_DIR/storage/" "$RELEASE_DIR/storage/"
 
-          "$PHP" "$COMPOSER" install --working-dir="$RELEASE_DIR" --no-dev --optimize-autoloader --no-interaction --prefer-dist
+          log 'Instalando dependencias PHP bloqueadas por composer.lock'
+          COMPOSER_ALLOW_SUPERUSER=1 "$PHP" "$COMPOSER" install \
+            --working-dir="$RELEASE_DIR" --no-dev --optimize-autoloader \
+            --no-interaction --prefer-dist
+          log 'Instalando dependencias frontend con npm ci y compilando Vite'
           (cd "$RELEASE_DIR" && npm ci && npm run build)
-          (cd "$RELEASE_DIR" && "$PHP" artisan config:cache && "$PHP" artisan route:cache && "$PHP" artisan view:cache)
+          log 'Generando cachés de Laravel'
+          (cd "$RELEASE_DIR" && "$PHP" artisan config:cache && \
+            "$PHP" artisan route:cache && "$PHP" artisan view:cache)
 
-          chown -R www:www "$RELEASE_DIR/storage" "$RELEASE_DIR/bootstrap/cache"
-          find "$RELEASE_DIR/storage" "$RELEASE_DIR/bootstrap/cache" -type d -exec chmod 775 {} +
-          find "$RELEASE_DIR/storage" "$RELEASE_DIR/bootstrap/cache" -type f -exec chmod 664 {} +
-          runuser -u www -- test -w "$RELEASE_DIR/storage"
-          runuser -u www -- test -w "$RELEASE_DIR/bootstrap/cache"
+          normalize_code_permissions "$RELEASE_DIR"
+          set_runtime_permissions "$RELEASE_DIR"
+          assert_www_runtime "$RELEASE_DIR"
+          log 'Arrancando Laravel como usuario www antes de publicar'
+          runuser -u www -- "$PHP" "$RELEASE_DIR/artisan" about --only=environment
 
-          mkdir -p "$BACKUP_DIR"
-          rsync -a --exclude='.git' --exclude='.env' --exclude='storage/' \
-            --exclude='public/.user.ini' --exclude='public/.well-known/' \
-            "$APP_DIR/" "$BACKUP_DIR/"
-          printf '%s\n' "$CURRENT" > "$BACKUP_DIR/COMMIT"
+          PHASE=backup
+          log "Creando rollback de la versión $PREVIOUS_SHA en $BACKUP_DIR"
+          umask 077
+          install -d -m 700 "$BACKUP_DIR"
+          rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$APP_DIR/" "$BACKUP_DIR/"
+          printf '%s\n' "$PREVIOUS_SHA" > "$BACKUP_DIR/COMMIT"
+          chmod 600 "$BACKUP_DIR/COMMIT"
+          BACKUP_READY=1
 
-          rsync -a --exclude='.env' --exclude='storage/' --exclude='public/.user.ini' \
-            --exclude='public/.well-known/' --exclude='package-lock.json' \
-            "$RELEASE_DIR/" "$APP_DIR/"
-          chown -R www:www "$APP_DIR/storage" "$APP_DIR/bootstrap/cache"
-          find "$APP_DIR/storage" "$APP_DIR/bootstrap/cache" -type d -exec chmod 775 {} +
-          find "$APP_DIR/storage" "$APP_DIR/bootstrap/cache" -type f -exec chmod 664 {} +
-          assert_www_permissions
-          printf '%s\n' "$TARGET" > "$CONTROL_ROOT/deployed-commit"
+          PHASE=publish
+          log "Publicando $TARGET; se preservan .env, storage, .user.ini y .well-known"
+          PUBLISH_STARTED=1
+          rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$RELEASE_DIR/" "$APP_DIR/"
+          chmod 755 "$APP_DIR"
+          set_runtime_permissions "$APP_DIR"
+          assert_www_runtime "$APP_DIR"
+          runuser -u www -- "$PHP" "$APP_DIR/artisan" about --only=environment
 
-          rollback() {
-            echo 'La verificación falló; restaurando código y archivos públicos anteriores.' >&2
-            rsync -a "$BACKUP_DIR/" "$APP_DIR/"
-            chown -R www:www "$APP_DIR/storage" "$APP_DIR/bootstrap/cache"
-            find "$APP_DIR/storage" "$APP_DIR/bootstrap/cache" -type d -exec chmod 775 {} +
-            find "$APP_DIR/storage" "$APP_DIR/bootstrap/cache" -type f -exec chmod 664 {} +
-            assert_www_permissions
-            printf '%s\n' "$CURRENT" > "$CONTROL_ROOT/deployed-commit"
-            exit 1
-          }
-
+          PHASE=http-validation
           check_code() {
             local url expected actual
             while IFS='|' read -r url expected; do
+              log "Comprobando $url (esperado HTTP $expected)"
               actual=$(curl -sS -o /dev/null -w '%{http_code}' "$url") || actual=000
               if [ "$actual" != "$expected" ]; then
-                echo "Verificación fallida: $url devolvió HTTP $actual; esperado HTTP $expected." >&2
-                return 1
+                fail "$url devolvió HTTP $actual; esperado HTTP $expected."
               fi
             done <<'CHECKS'
           https://api.mykesystems.com/api/v1/leads|405
-          https://api.mykesystems.com/api/admin/me|401
+          https://api.mykesystems.com/api/admin/me|404
           https://admin.mykesystems.com/api/admin/me|401
           https://admin.mykesystems.com/sanctum/csrf-cookie|204
           CHECKS
           }
-          check_code || rollback
-          echo "Desplegado commit $TARGET"
+          check_code
 
-          find "$RELEASE_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -nr | tail -n +6 | cut -d' ' -f2- | xargs -r rm -rf
-          find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -nr | tail -n +4 | cut -d' ' -f2- | xargs -r rm -rf
+          PHASE=finalize
+          log 'Registrando la versión publicada como fuente de verdad'
+          git -C "$APP_DIR" update-ref refs/heads/main "$TARGET"
+          write_deployed_marker "$TARGET"
+          printf '%s|success|%s|%s\n' "$(date -u +%FT%TZ)" "$PREVIOUS_SHA" "$TARGET" \
+            >> "$CONTROL_ROOT/deploy-history.log"
+          chmod 600 "$CONTROL_ROOT/deploy-history.log"
+          PUBLISH_STARTED=0
+          trap - ERR
+          log "Desplegado commit $TARGET; versión anterior: $PREVIOUS_SHA"
+
+          PHASE=retention
+          find "$RELEASE_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
+            | sort -nr | tail -n +6 | cut -d' ' -f2- | xargs -r rm -rf \
+            || echo '[deploy][retention] ADVERTENCIA: no se pudieron depurar releases antiguos.' >&2
+          find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' \
+            | sort -nr | tail -n +4 | cut -d' ' -f2- | xargs -r rm -rf \
+            || echo '[deploy][retention] ADVERTENCIA: no se pudieron depurar backups antiguos.' >&2
           REMOTE_SCRIPT
