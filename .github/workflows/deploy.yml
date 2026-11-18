@@ -1,0 +1,129 @@
+name: Deploy MykePortal API
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: mykeportalapi-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 20
+
+    steps:
+      - name: Configure SSH
+        shell: bash
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST_KEY: ${{ secrets.VPS_HOST_KEY }}
+        run: |
+          set -Eeuo pipefail
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$VPS_SSH_KEY" > "$HOME/.ssh/mykeportalapi_key"
+          printf '%s\n' "$VPS_HOST_KEY" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/mykeportalapi_key" "$HOME/.ssh/known_hosts"
+
+      - name: Deploy through SSH
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_KEY: ${{ github.workspace }}/../.ssh/mykeportalapi_key
+        run: |
+          set -Eeuo pipefail
+          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -i "$HOME/.ssh/mykeportalapi_key" "$VPS_USER@$VPS_HOST" 'bash -s' <<'REMOTE_SCRIPT'
+          set -Eeuo pipefail
+          umask 077
+
+          APP_DIR=/www/wwwroot/mykeportalapi
+          PHP=/www/server/php/84/bin/php
+          COMPOSER=/usr/bin/composer
+          EXPECTED_REPO='MiguelGarciaBarahona/mykeportalapi'
+          RELEASE_ROOT=/www/wwwroot/.mykeportalapi-releases
+          BACKUP_ROOT=/www/wwwroot/.mykeportalapi-backups
+          TIMESTAMP=$(date -u +%Y%m%d%H%M%S)
+          RELEASE_DIR="$RELEASE_ROOT/$TIMESTAMP-${GITHUB_SHA:-manual}"
+          BACKUP_DIR="$BACKUP_ROOT/$TIMESTAMP"
+
+          test -d "$APP_DIR/.git"
+          test -x "$PHP"
+          test -x "$COMPOSER"
+          test -w "$APP_DIR"
+          test "$(df -Pk "$APP_DIR" | awk 'NR==2 {print $4}')" -ge 1048576
+
+          exec 9>"$APP_DIR/.deploy.lock"
+          flock -n 9 || { echo 'Ya existe un despliegue en curso.' >&2; exit 1; }
+
+          REMOTE_URL=$(git -C "$APP_DIR" remote get-url origin)
+          case "$REMOTE_URL" in
+            https://github.com/$EXPECTED_REPO.git|git@github.com:$EXPECTED_REPO.git|git@github-mykeportalapi:$EXPECTED_REPO.git) ;;
+            *) echo 'El remoto origin no corresponde al repositorio esperado.' >&2; exit 1 ;;
+          esac
+
+          git -C "$APP_DIR" fetch --prune origin main
+          TARGET=$(git -C "$APP_DIR" rev-parse origin/main)
+          CURRENT=$(git -C "$APP_DIR" rev-parse HEAD)
+          git -C "$APP_DIR" merge-base --is-ancestor "$CURRENT" "$TARGET" || {
+            echo 'El despliegue remoto no es fast-forward; se detiene sin modificar producción.' >&2
+            exit 1
+          }
+
+          test -f "$APP_DIR/package.json"
+          test -f "$APP_DIR/package-lock.json" || {
+            echo 'Falta package-lock.json en producción; no se ejecuta npm ci.' >&2
+            exit 1
+          }
+          grep -q '^APP_ENV=production' "$APP_DIR/.env"
+          grep -q '^APP_DEBUG=false' "$APP_DIR/.env"
+
+          mkdir -p "$RELEASE_DIR" "$BACKUP_ROOT"
+          git -C "$APP_DIR" archive "$TARGET" | tar -x -C "$RELEASE_DIR"
+          cp -a "$APP_DIR/.env" "$RELEASE_DIR/.env"
+          cp -a "$APP_DIR/package-lock.json" "$RELEASE_DIR/package-lock.json"
+          cp -a "$APP_DIR/storage" "$RELEASE_DIR/storage"
+          test ! -e "$APP_DIR/public/.user.ini" || cp -a "$APP_DIR/public/.user.ini" "$RELEASE_DIR/public/.user.ini"
+          test ! -d "$APP_DIR/public/.well-known" || cp -a "$APP_DIR/public/.well-known" "$RELEASE_DIR/public/.well-known"
+
+          "$PHP" "$COMPOSER" install --working-dir="$RELEASE_DIR" --no-dev --optimize-autoloader --no-interaction --prefer-dist
+          (cd "$RELEASE_DIR" && npm ci && npm run build)
+          test -w "$RELEASE_DIR/storage" && test -w "$RELEASE_DIR/bootstrap/cache"
+          (cd "$RELEASE_DIR" && "$PHP" artisan config:cache && "$PHP" artisan route:cache && "$PHP" artisan view:cache)
+
+          mkdir -p "$BACKUP_DIR"
+          rsync -a --exclude='.git' --exclude='.env' --exclude='storage/' \
+            --exclude='public/.user.ini' --exclude='public/.well-known/' \
+            "$APP_DIR/" "$BACKUP_DIR/"
+          printf '%s\n' "$CURRENT" > "$BACKUP_DIR/COMMIT"
+
+          # Publicación conservadora: no elimina archivos no rastreados de producción.
+          rsync -a "$RELEASE_DIR/" "$APP_DIR/"
+          printf '%s\n' "$TARGET" > "$APP_DIR/.deployed-commit"
+
+          rollback() {
+            echo 'La verificación falló; restaurando el código anterior.' >&2
+            rsync -a "$BACKUP_DIR/" "$APP_DIR/"
+            printf '%s\n' "$CURRENT" > "$APP_DIR/.deployed-commit"
+            exit 1
+          }
+
+          check_code() {
+            test "$(curl -ksS -o /dev/null -w '%{http_code}' https://api.mykesystems.com/api/v1/leads)" = 405
+            test "$(curl -ksS -o /dev/null -w '%{http_code}' https://api.mykesystems.com/api/admin/me)" = 401
+            test "$(curl -ksS -o /dev/null -w '%{http_code}' https://admin.mykesystems.com/api/admin/me)" = 401
+            test "$(curl -ksS -o /dev/null -w '%{http_code}' https://admin.mykesystems.com/sanctum/csrf-cookie)" = 204
+          }
+          check_code || rollback
+          echo "Desplegado commit $TARGET"
+
+          find "$RELEASE_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -nr | tail -n +6 | cut -d' ' -f2- | xargs -r rm -rf
+          find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -nr | tail -n +4 | cut -d' ' -f2- | xargs -r rm -rf
+          REMOTE_SCRIPT
