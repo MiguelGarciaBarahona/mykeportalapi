@@ -7,6 +7,22 @@
 <a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
 </p>
 
+## MykePortal API
+
+API y panel administrativo de MykeSystems, desarrollado con Laravel. Incluye gestión de solicitudes, usuarios administradores, finanzas, auditoría y notificaciones push.
+
+## Despliegue rápido
+
+1. Clona el repositorio y entra a la carpeta del proyecto.
+2. Ejecuta `composer install --no-dev --optimize-autoloader`.
+3. Copia `.env.example` como `.env` y configura la base de datos, correo, CORS y las claves necesarias.
+4. Ejecuta `php artisan key:generate` y `php artisan migrate --force`.
+5. Ejecuta `php artisan storage:link`, `php artisan config:cache` y `php artisan route:cache`.
+6. Configura el servidor web para que apunte a la carpeta `public/`.
+7. Configura el cron de Laravel indicado al final de este documento.
+
+No subas `.env`, credenciales ni claves privadas al repositorio.
+
 ## About Laravel
 
 Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
