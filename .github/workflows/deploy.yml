@@ -137,6 +137,53 @@ jobs:
             test -z "$inaccessible" || { fail "www no puede leer $inaccessible"; return 1; }
           }
 
+          assert_no_release_references() {
+            local root=$1 referenced_file
+            referenced_file=$(grep -RIlF -- "$RELEASE_ROOT/" \
+              "$root/bootstrap/cache" "$root/storage/framework/views" 2>/dev/null \
+              | head -n 1 || true)
+            if [ -n "$referenced_file" ]; then
+              fail "La caché $referenced_file todavía referencia un release temporal."
+              return 1
+            fi
+            log "Cachés verificadas sin referencias a $RELEASE_ROOT/"
+          }
+
+          rebuild_production_caches() {
+            local root=$1
+            log "Limpiando cachés previas desde el directorio definitivo $root"
+            set_runtime_permissions "$root" || return 1
+            runuser -u www -- "$PHP" "$root/artisan" config:clear || return 1
+            runuser -u www -- "$PHP" "$root/artisan" route:clear || return 1
+            runuser -u www -- "$PHP" "$root/artisan" view:clear || return 1
+
+            log "Regenerando cachés desde el directorio definitivo $root"
+            runuser -u www -- "$PHP" "$root/artisan" config:cache || return 1
+            runuser -u www -- "$PHP" "$root/artisan" route:cache || return 1
+            runuser -u www -- "$PHP" "$root/artisan" view:cache || return 1
+            set_runtime_permissions "$root" || return 1
+            assert_www_runtime "$root" || return 1
+            assert_no_release_references "$root" || return 1
+            runuser -u www -- "$PHP" "$root/artisan" about --only=environment || return 1
+          }
+
+          check_code() {
+            local url expected actual
+            while IFS='|' read -r url expected; do
+              log "Comprobando $url (esperado HTTP $expected)"
+              actual=$(curl -sS -o /dev/null -w '%{http_code}' "$url") || actual=000
+              if [ "$actual" != "$expected" ]; then
+                fail "$url devolvió HTTP $actual; esperado HTTP $expected."
+                return 1
+              fi
+            done <<'CHECKS'
+          https://api.mykesystems.com/api/v1/leads|405
+          https://api.mykesystems.com/api/admin/me|404
+          https://admin.mykesystems.com/api/admin/me|401
+          https://admin.mykesystems.com/sanctum/csrf-cookie|204
+          CHECKS
+          }
+
           rollback() {
             local original_status=$1 rollback_status=0
             trap - ERR
@@ -147,7 +194,10 @@ jobs:
             rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$BACKUP_DIR/" "$APP_DIR/" || rollback_status=1
             chmod 755 "$APP_DIR" || rollback_status=1
             set_runtime_permissions "$APP_DIR" || rollback_status=1
-            assert_www_runtime "$APP_DIR" || rollback_status=1
+            rebuild_production_caches "$APP_DIR" || rollback_status=1
+            if (( rollback_status == 0 )); then
+              check_code || rollback_status=1
+            fi
             git -C "$APP_DIR" update-ref refs/heads/main "$PREVIOUS_SHA" || rollback_status=1
             write_deployed_marker "$PREVIOUS_SHA" || rollback_status=1
             printf '%s|rollback|%s|%s\n' "$(date -u +%FT%TZ)" "$TARGET" "$PREVIOUS_SHA" \
@@ -239,9 +289,13 @@ jobs:
             --no-interaction --prefer-dist
           log 'Instalando dependencias frontend con npm ci y compilando Vite'
           (cd "$RELEASE_DIR" && npm ci && npm run build)
-          log 'Generando cachés de Laravel'
+          log 'Validando la generación de cachés dentro del release aislado'
           (cd "$RELEASE_DIR" && "$PHP" artisan config:cache && \
             "$PHP" artisan route:cache && "$PHP" artisan view:cache)
+          log 'Eliminando del release las cachés que contienen rutas temporales'
+          (cd "$RELEASE_DIR" && "$PHP" artisan config:clear && \
+            "$PHP" artisan route:clear && "$PHP" artisan view:clear)
+          assert_no_release_references "$RELEASE_DIR"
 
           normalize_code_permissions "$RELEASE_DIR"
           set_runtime_permissions "$RELEASE_DIR"
@@ -264,25 +318,10 @@ jobs:
           rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$RELEASE_DIR/" "$APP_DIR/"
           chmod 755 "$APP_DIR"
           set_runtime_permissions "$APP_DIR"
-          assert_www_runtime "$APP_DIR"
-          runuser -u www -- "$PHP" "$APP_DIR/artisan" about --only=environment
+          PHASE=production-cache
+          rebuild_production_caches "$APP_DIR"
 
           PHASE=http-validation
-          check_code() {
-            local url expected actual
-            while IFS='|' read -r url expected; do
-              log "Comprobando $url (esperado HTTP $expected)"
-              actual=$(curl -sS -o /dev/null -w '%{http_code}' "$url") || actual=000
-              if [ "$actual" != "$expected" ]; then
-                fail "$url devolvió HTTP $actual; esperado HTTP $expected."
-              fi
-            done <<'CHECKS'
-          https://api.mykesystems.com/api/v1/leads|405
-          https://api.mykesystems.com/api/admin/me|404
-          https://admin.mykesystems.com/api/admin/me|401
-          https://admin.mykesystems.com/sanctum/csrf-cookie|204
-          CHECKS
-          }
           check_code
 
           PHASE=finalize
