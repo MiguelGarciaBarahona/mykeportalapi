@@ -46,6 +46,7 @@ jobs:
             bash -s -- "$DEPLOY_SHA" <<'REMOTE_SCRIPT'
           set -Eeuo pipefail
           umask 077
+          cd /
 
           APP_DIR=/www/wwwroot/mykeportalapi
           PHP=/www/server/php/84/bin/php
